@@ -29,7 +29,7 @@ async function action() {
     .filter((r) => r);
 
     // Fetch runs that require action
-    let { data: runs } = await octokit.actions.listWorkflowRunsForRepo({
+    let { data: runs } = await octokit.rest.actions.listWorkflowRunsForRepo({
       owner,
       repo,
       status: "action_required",
@@ -45,7 +45,7 @@ async function action() {
     // name (available in the runs API) to the workflow file
     const nameToWorkflow = {};
     for (let w of allowedWorkflows) {
-      const { data: file } = await octokit.repos.getContent({
+      const { data: file } = await octokit.rest.repos.getContent({
         owner,
         repo,
         path: w,
@@ -65,6 +65,15 @@ async function action() {
         name = run.name;
       }
       return allowedWorkflows.includes(name);
+    });
+
+    // Filter out runs that are already completed — they can't be approved
+    runs = runs.filter((run) => {
+      if (run.status === "completed") {
+        console.log(`Skipping completed run '${run.id}' (cannot approve completed runs)`);
+        return false;
+      }
+      return true;
     });
 
     if (runs.length == 0) {
@@ -107,7 +116,7 @@ async function action() {
         repo,
         pull_number: pulls[0].number,
       });
-  
+
       const matching_danger = files.filter((f) => {
         for (let d of dangerousFiles) {
           if (f.filename.includes(d)) {
@@ -129,7 +138,7 @@ async function action() {
       });
 
       const matching = [].concat(matching_danger, matching_unsafe)
-  
+
       // If we changed any files in that directory, return the current set and skip this run
       if (matching.length > 0) {
         console.log(`Skipped dangerous run '${run.id}'`);
@@ -140,8 +149,8 @@ async function action() {
       return (await acc).concat(run);
     }, []);
 
-    // Loop through them and approve all
-    await Promise.all(
+    // Loop through them and approve all, continuing on individual failures
+    const results = await Promise.allSettled(
       runs.map(async (run) => {
         await octokit.request(
           "POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve",
@@ -154,6 +163,23 @@ async function action() {
         console.log(`Approved run '${run.id}'`);
       })
     );
+
+    const failures = results.filter((r) => r.status === "rejected");
+    if (failures.length > 0) {
+      for (const f of failures) {
+        const err = f.reason;
+        if (err.request && err.request.url) {
+          console.log(`Warning: failed to approve run - ${err.request.url} - HTTP ${err.status}`);
+        } else {
+          console.log(`Warning: failed to approve run - ${err.message}`);
+        }
+      }
+      const approved = results.length - failures.length;
+      if (approved === 0) {
+        return core.setFailed(`All ${failures.length} approval(s) failed`);
+      }
+      console.log(`Approved ${approved} run(s), ${failures.length} failed`);
+    }
   } catch (e) {
     if (e.request && e.request.url) {
       return core.setFailed(

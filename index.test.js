@@ -1,25 +1,40 @@
 const core = require("@actions/core");
-const action = require("./index");
+const github = require("@actions/github");
 const yaml = require("js-yaml");
-
-const nock = require("nock");
-nock.disableNetConnect();
+const action = require("./index");
 
 process.env.GITHUB_REPOSITORY = "demo/repo";
 
+let mockOctokit;
+const _workflowContents = {};
+
+beforeEach(() => {
+  mockOctokit = {
+    rest: {
+      actions: {
+        listWorkflowRunsForRepo: jest.fn(),
+      },
+      repos: {
+        getContent: jest.fn(),
+      },
+      pulls: {
+        list: jest.fn(),
+        listFiles: jest.fn(),
+      },
+    },
+    request: jest.fn(),
+  };
+  jest.spyOn(github, "getOctokit").mockReturnValue(mockOctokit);
+});
+
 afterEach(() => {
   jest.restoreAllMocks();
-  if (!nock.isDone()) {
-    throw new Error(
-      `Not all nock interceptors were used: ${JSON.stringify(
-        nock.pendingMocks()
-      )}`
-    );
-  }
-  nock.cleanAll();
+  Object.keys(_workflowContents).forEach((k) => delete _workflowContents[k]);
 });
 
 it("throws if no token is provided", async () => {
+  // Don't mock any inputs — token will be missing
+  mockInput({});
   jest.spyOn(core, "setFailed").mockImplementation(() => {});
   await action();
   expect(core.setFailed).toBeCalledWith(
@@ -28,7 +43,7 @@ it("throws if no token is provided", async () => {
 });
 
 it("throws if no workflow list is provided", async () => {
-  mockInputToken();
+  mockInput({ token: "my-token" });
   jest.spyOn(core, "setFailed").mockImplementation(() => {});
   await action();
   expect(core.setFailed).toBeCalledWith(
@@ -37,16 +52,13 @@ it("throws if no workflow list is provided", async () => {
 });
 
 it("returns early if there are no runs with action required", async () => {
-  mockInputToken();
-  mockInputWorkflows();
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
-      total_count: 0,
-      workflow_runs: [],
-    });
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: { total_count: 0, workflow_runs: [] },
+  });
+
   await action();
   expect(console.log).toBeCalledWith(
     "No runs found with status 'action_required'"
@@ -54,24 +66,17 @@ it("returns early if there are no runs with action required", async () => {
 });
 
 it("returns early if there are no runs that match the provided workflow", async () => {
-  mockInputToken();
-  mockInputWorkflows();
-  mockWorkflowContents("pr.yml", {});
-  mockWorkflowContents("another.yml", {});
-
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
       total_count: 1,
-      workflow_runs: [
-        {
-          name: ".github/workflows/other-workflow.yml",
-          id: "12345678",
-        },
-      ],
-    });
+      workflow_runs: [{ name: ".github/workflows/other-workflow.yml", id: "12345678" }],
+    },
+  });
+  mockWorkflowContents("pr.yml", {});
+  mockWorkflowContents("another.yml", {});
 
   await action();
   expect(console.log).toBeCalledWith(
@@ -80,62 +85,130 @@ it("returns early if there are no runs that match the provided workflow", async 
 });
 
 it("handles HTTP 500 errors and exits with a failure code", async () => {
-  mockInputToken();
-  mockInputWorkflows();
-
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
   jest.spyOn(core, "setFailed").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(500);
+  const error = new Error("server error");
+  error.status = 500;
+  error.request = { url: "https://api.github.com/repos/demo/repo/actions/runs?status=action_required" };
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockRejectedValue(error);
+
   await action();
   expect(core.setFailed).toBeCalledWith(
     "Error fetching https://api.github.com/repos/demo/repo/actions/runs?status=action_required - HTTP 500"
   );
 });
 
-it("removes any runs that edit .github/workflows", async () => {
-  mockInputToken();
-  mockInputWorkflows();
-  mockWorkflowContents("pr.yml", {});
-  mockWorkflowContents("another.yml", {});
+it("skips completed runs that cannot be approved", async () => {
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
+      total_count: 1,
+      workflow_runs: [
+        {
+          name: ".github/workflows/pr.yml",
+          id: "12345678",
+          status: "completed",
+          head_branch: "patch-1",
+          head_repository: { owner: { login: "user-a" } },
+        },
+      ],
+    },
+  });
+  mockWorkflowContents("pr.yml", {});
+  mockWorkflowContents("another.yml", {});
+
+  await action();
+  expect(console.log).toBeCalledWith(
+    "Skipping completed run '12345678' (cannot approve completed runs)"
+  );
+});
+
+it("continues approving other runs when one fails with 403", async () => {
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
+  jest.spyOn(console, "log").mockImplementation(() => {});
+
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
+      total_count: 2,
+      workflow_runs: [
+        {
+          name: ".github/workflows/pr.yml",
+          id: "11111111",
+          status: "waiting",
+          head_branch: "patch-1",
+          head_repository: { owner: { login: "user-a" } },
+        },
+        {
+          name: ".github/workflows/pr.yml",
+          id: "22222222",
+          status: "waiting",
+          head_branch: "patch-2",
+          head_repository: { owner: { login: "user-b" } },
+        },
+      ],
+    },
+  });
+  mockWorkflowContents("pr.yml", {});
+  mockWorkflowContents("another.yml", {});
+
+  mockOctokit.rest.pulls.list
+    .mockResolvedValueOnce({ data: [{ number: 99 }] })
+    .mockResolvedValueOnce({ data: [{ number: 42 }] });
+  mockOctokit.rest.pulls.listFiles
+    .mockResolvedValueOnce({ data: [{ filename: "README.md" }] })
+    .mockResolvedValueOnce({ data: [{ filename: "README.md" }] });
+
+  const error403 = new Error("Forbidden");
+  error403.status = 403;
+  error403.request = { url: "https://api.github.com/repos/demo/repo/actions/runs/11111111/approve" };
+  mockOctokit.request
+    .mockRejectedValueOnce(error403)
+    .mockResolvedValueOnce({});
+
+  await action();
+  expect(console.log).toBeCalledWith("Approved run '22222222'");
+  expect(console.log).toBeCalledWith(
+    expect.stringContaining("Warning: failed to approve run")
+  );
+});
+
+it("removes any runs that edit .github/workflows", async () => {
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
+  jest.spyOn(console, "log").mockImplementation(() => {});
+
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
       total_count: 2,
       workflow_runs: [
         {
           name: ".github/workflows/pr.yml",
           id: "12345678",
           head_branch: "patch-1",
-          head_repository: {
-            owner: {
-              login: "user-a",
-            },
-          },
+          head_repository: { owner: { login: "user-a" } },
         },
         {
           name: ".github/workflows/pr.yml",
           id: "87654321",
           head_branch: "totally-honest-update-no-miners-here",
-          head_repository: {
-            owner: {
-              login: "bad-actor",
-            },
-          },
+          head_repository: { owner: { login: "bad-actor" } },
         },
       ],
-    });
+    },
+  });
+  mockWorkflowContents("pr.yml", {});
+  mockWorkflowContents("another.yml", {});
 
-  mockGetPr("user-a%3Apatch-1", 99);
-  mockGetPr("bad-actor%3Atotally-honest-update-no-miners-here", 321);
+  mockOctokit.rest.pulls.list
+    .mockResolvedValueOnce({ data: [{ number: 99 }] })
+    .mockResolvedValueOnce({ data: [{ number: 321 }] });
+  mockOctokit.rest.pulls.listFiles
+    .mockResolvedValueOnce({ data: [{ filename: "README.md" }] })
+    .mockResolvedValueOnce({ data: [{ filename: ".github/workflows/miner.yml" }] });
 
-  mockPrFiles(99, ["README.md"]);
-  mockPrFiles(321, [".github/workflows/miner.yml"]);
-
-  mockApprove(12345678);
+  mockOctokit.request.mockResolvedValue({});
 
   await action();
   expect(console.log).toBeCalledWith("Skipped dangerous run '87654321'");
@@ -143,189 +216,127 @@ it("removes any runs that edit .github/workflows", async () => {
 });
 
 it("removes any runs that edit a file in dangerous_files", async () => {
-  mockInputToken();
-  mockInputWorkflows();
-  mockInputDangerousFiles("build.js");
-  mockWorkflowContents("pr.yml", {});
-  mockWorkflowContents("another.yml", {});
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml", dangerous_files: "build.js" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
-      total_count: 2,
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
+      total_count: 1,
       workflow_runs: [
         {
           name: ".github/workflows/pr.yml",
           id: "12345678",
           head_branch: "patch-1",
-          head_repository: {
-            owner: {
-              login: "z-user",
-            },
-          },
+          head_repository: { owner: { login: "z-user" } },
         },
       ],
-    });
+    },
+  });
+  mockWorkflowContents("pr.yml", {});
+  mockWorkflowContents("another.yml", {});
 
-  mockGetPr("z-user%3Apatch-1", 1713);
-
-  mockPrFiles(1713, ["README.md", "build.js"]);
+  mockOctokit.rest.pulls.list.mockResolvedValue({ data: [{ number: 1713 }] });
+  mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+    data: [{ filename: "README.md" }, { filename: "build.js" }],
+  });
 
   await action();
   expect(console.log).toBeCalledWith("Skipped dangerous run '12345678'");
 });
 
 it("removes any runs that edit a file outside safe_files", async () => {
-  mockInputToken();
-  mockInputWorkflows();
-  mockInputSafeFiles("docs/");
-  mockWorkflowContents("pr.yml", {});
-  mockWorkflowContents("another.yml", {});
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml", safe_files: "docs/" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
-      total_count: 2,
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
+      total_count: 1,
       workflow_runs: [
         {
           name: ".github/workflows/pr.yml",
           id: "12345678",
           head_branch: "patch-1",
-          head_repository: {
-            owner: {
-              login: "z-user",
-            },
-          },
+          head_repository: { owner: { login: "z-user" } },
         },
       ],
-    });
+    },
+  });
+  mockWorkflowContents("pr.yml", {});
+  mockWorkflowContents("another.yml", {});
 
-  mockGetPr("z-user%3Apatch-1", 1713);
-
-  mockPrFiles(1713, ["build.js", "docs/index.md"]);
+  mockOctokit.rest.pulls.list.mockResolvedValue({ data: [{ number: 1713 }] });
+  mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+    data: [{ filename: "build.js" }, { filename: "docs/index.md" }],
+  });
 
   await action();
   expect(console.log).toBeCalledWith("Skipped dangerous run '12345678'");
 });
 
 it("approves any runs that edit a file inside safe_files", async () => {
-  mockInputToken();
-  mockInputWorkflows();
-  mockInputSafeFiles("docs/");
-  mockWorkflowContents("pr.yml", {});
-  mockWorkflowContents("another.yml", {});
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml", safe_files: "docs/" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
-      total_count: 2,
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
+      total_count: 1,
       workflow_runs: [
         {
           name: ".github/workflows/pr.yml",
           id: "12345678",
           head_branch: "patch-1",
-          head_repository: {
-            owner: {
-              login: "z-user",
-            },
-          },
+          head_repository: { owner: { login: "z-user" } },
         },
       ],
-    });
-
-  mockGetPr("z-user%3Apatch-1", 1713);
-
-  mockPrFiles(1713, ["docs/asdf.md", "docs/index.md"]);
-
-  mockApprove(12345678);
-
-  await action();
-  expect(console.log).toBeCalledWith("Approved run '12345678'");
-});
-
-it("approves any runs that edit a file inside multiple safe_files", async () => {
-  mockInputToken();
-  mockInputWorkflows();
-  mockInputSafeFiles("docs/,other/");
+    },
+  });
   mockWorkflowContents("pr.yml", {});
   mockWorkflowContents("another.yml", {});
-  jest.spyOn(console, "log").mockImplementation(() => {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
-      total_count: 2,
-      workflow_runs: [
-        {
-          name: ".github/workflows/pr.yml",
-          id: "12345678",
-          head_branch: "patch-1",
-          head_repository: {
-            owner: {
-              login: "z-user",
-            },
-          },
-        },
-      ],
-    });
-
-  mockGetPr("z-user%3Apatch-1", 1713);
-
-  mockPrFiles(1713, ["docs/asdf.md", "docs/index.md"]);
-
-  mockApprove(12345678);
+  mockOctokit.rest.pulls.list.mockResolvedValue({ data: [{ number: 1713 }] });
+  mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+    data: [{ filename: "docs/asdf.md" }, { filename: "docs/index.md" }],
+  });
+  mockOctokit.request.mockResolvedValue({});
 
   await action();
   expect(console.log).toBeCalledWith("Approved run '12345678'");
 });
 
 it("approves all pending workflows (no name)", async () => {
-  mockInputToken();
-  mockInputWorkflows();
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
   mockWorkflowContents("pr.yml", {});
   mockWorkflowContents("another.yml", {});
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
       total_count: 2,
       workflow_runs: [
         {
           name: ".github/workflows/pr.yml",
           id: "12345678",
           head_branch: "patch-1",
-          head_repository: {
-            owner: {
-              login: "user-a",
-            },
-          },
+          head_repository: { owner: { login: "user-a" } },
         },
         {
           name: ".github/workflows/pr.yml",
           id: "87654321",
           head_branch: "update-readme",
-          head_repository: {
-            owner: {
-              login: "user-b",
-            },
-          },
+          head_repository: { owner: { login: "user-b" } },
         },
       ],
-    });
+    },
+  });
 
-  mockGetPr("user-a%3Apatch-1", 99);
-  mockGetPr("user-b%3Aupdate-readme", 42);
-
-  mockPrFiles(99, ["README.md"]);
-  mockPrFiles(42, ["README.md"]);
-
-  mockApprove(12345678);
-  mockApprove(87654321);
+  mockOctokit.rest.pulls.list
+    .mockResolvedValueOnce({ data: [{ number: 99 }] })
+    .mockResolvedValueOnce({ data: [{ number: 42 }] });
+  mockOctokit.rest.pulls.listFiles
+    .mockResolvedValueOnce({ data: [{ filename: "README.md" }] })
+    .mockResolvedValueOnce({ data: [{ filename: "README.md" }] });
+  mockOctokit.request.mockResolvedValue({});
 
   await action();
   expect(console.log).toBeCalledWith("Approved run '12345678'");
@@ -333,110 +344,69 @@ it("approves all pending workflows (no name)", async () => {
 });
 
 it("approves all pending workflows (with name)", async () => {
-  mockInputToken();
-  mockInputWorkflows();
+  mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
   mockWorkflowContents("pr.yml", { name: "Run Tests" });
   mockWorkflowContents("another.yml", { name: "Do Another Thing" });
 
-  nock("https://api.github.com")
-    .get("/repos/demo/repo/actions/runs?status=action_required")
-    .reply(200, {
+  mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+    data: {
       total_count: 2,
       workflow_runs: [
         {
           name: "Run Tests",
           id: "12345678",
           head_branch: "patch-1",
-          head_repository: {
-            owner: {
-              login: "user-a",
-            },
-          },
+          head_repository: { owner: { login: "user-a" } },
         },
         {
           name: "Do Another Thing",
           id: "87654321",
           head_branch: "update-readme",
-          head_repository: {
-            owner: {
-              login: "user-b",
-            },
-          },
+          head_repository: { owner: { login: "user-b" } },
         },
       ],
-    });
+    },
+  });
 
-  mockGetPr("user-a%3Apatch-1", 99);
-  mockGetPr("user-b%3Aupdate-readme", 42);
-
-  mockPrFiles(99, ["README.md"]);
-  mockPrFiles(42, ["README.md"]);
-
-  mockApprove(12345678);
-  mockApprove(87654321);
+  mockOctokit.rest.pulls.list
+    .mockResolvedValueOnce({ data: [{ number: 99 }] })
+    .mockResolvedValueOnce({ data: [{ number: 42 }] });
+  mockOctokit.rest.pulls.listFiles
+    .mockResolvedValueOnce({ data: [{ filename: "README.md" }] })
+    .mockResolvedValueOnce({ data: [{ filename: "README.md" }] });
+  mockOctokit.request.mockResolvedValue({});
 
   await action();
   expect(console.log).toBeCalledWith("Approved run '12345678'");
   expect(console.log).toBeCalledWith("Approved run '87654321'");
 });
 
-function mockInputToken() {
-  jest.spyOn(core, "getInput").mockImplementationOnce(() => "my-token");
-}
+// --- Helpers ---
 
-function mockInputWorkflows(workflows) {
-  workflows = workflows || "pr.yml,another.yml";
-  jest
-    .spyOn(core, "getInput")
-    .mockImplementationOnce(() => "pr.yml,another.yml");
-}
-
-function mockInputDangerousFiles(files) {
-  jest.spyOn(core, "getInput").mockImplementationOnce(() => files).mockImplementationOnce(() => '');
-}
-
-function mockInputSafeFiles(files) {
-  jest.spyOn(core, "getInput").mockImplementationOnce(() => '').mockImplementationOnce(() => files);
-}
-
-function mockGetPr(actor, number) {
-  nock("https://api.github.com")
-    .get(`/repos/demo/repo/pulls?state=all&head=${actor}`)
-    .reply(200, [
-      {
-        number,
-      },
-    ]);
-}
-
-function mockPrFiles(number, files) {
-  nock("https://api.github.com")
-    .get(`/repos/demo/repo/pulls/${number}/files`)
-    .reply(
-      200,
-      files.map((f) => {
-        return { filename: f };
-      })
-    );
-}
-
-function mockApprove(run) {
-  nock("https://api.github.com")
-    .post(`/repos/demo/repo/actions/runs/${run}/approve`)
-    .reply(200);
+function mockInput(inputs) {
+  const defaults = { token: "", workflows: "", dangerous_files: "", safe_files: "" };
+  const merged = { ...defaults, ...inputs };
+  jest.spyOn(core, "getInput").mockImplementation((name, opts) => {
+    const val = merged[name] || "";
+    if (opts?.required && !val) {
+      throw new Error(`Input required and not supplied: ${name}`);
+    }
+    return val;
+  });
 }
 
 function mockWorkflowContents(name, content) {
-  content = {
-    on: "push",
-    jobs: [],
-    ...content,
-  };
-  nock("https://api.github.com")
-    .get(`/repos/demo/repo/contents/.github%2Fworkflows%2F${name}`)
-    .reply(200, {
-      content: Buffer.from(yaml.dump(content)).toString("base64"),
-    });
+  content = { on: "push", jobs: [], ...content };
+  _workflowContents[`.github/workflows/${name}`] = content;
+  mockOctokit.rest.repos.getContent.mockImplementation(async ({ path }) => {
+    const wf = _workflowContents[path];
+    if (wf) {
+      return {
+        data: { content: Buffer.from(yaml.dump(wf)).toString("base64") },
+      };
+    }
+    throw new Error(`No mock for ${path}`);
+  });
 }
