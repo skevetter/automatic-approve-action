@@ -99,7 +99,7 @@ it("handles HTTP 500 errors and exits with a failure code", async () => {
   );
 });
 
-it("skips completed runs that cannot be approved", async () => {
+it("attempts to approve completed runs (API may still accept them)", async () => {
   mockInput({ token: "my-token", workflows: "pr.yml,another.yml" });
   jest.spyOn(console, "log").mockImplementation(() => {});
 
@@ -120,10 +120,14 @@ it("skips completed runs that cannot be approved", async () => {
   mockWorkflowContents("pr.yml", {});
   mockWorkflowContents("another.yml", {});
 
+  mockOctokit.rest.pulls.list.mockResolvedValue({ data: [{ number: 99 }] });
+  mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+    data: [{ filename: "README.md" }],
+  });
+  mockOctokit.request.mockResolvedValue({});
+
   await action();
-  expect(console.log).toBeCalledWith(
-    "Skipping completed run '12345678' (cannot approve completed runs)"
-  );
+  expect(console.log).toBeCalledWith("Approved run '12345678'");
 });
 
 it("continues approving other runs when one fails with 403", async () => {

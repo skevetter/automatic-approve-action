@@ -67,15 +67,6 @@ async function action() {
       return allowedWorkflows.includes(name);
     });
 
-    // Filter out runs that are already completed — they can't be approved
-    runs = runs.filter((run) => {
-      if (run.status === "completed") {
-        console.log(`Skipping completed run '${run.id}' (cannot approve completed runs)`);
-        return false;
-      }
-      return true;
-    });
-
     if (runs.length == 0) {
       console.log(
         `No runs found for the following workflows: ${allowedWorkflows.join(
