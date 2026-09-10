@@ -128,6 +128,28 @@ async function action() {
         return acc;
       }
 
+      // Determine if this run represents an API-approvable fork PR hold
+      const baseRepoFullName = `${owner}/${repo}`.toLowerCase();
+      const headRepoFullName = (
+        run.head_repository.full_name ||
+        (run.head_repository.owner
+          ? `${run.head_repository.owner.login}/${repo}`
+          : "")
+      ).toLowerCase();
+
+      const isSameRepo =
+        headRepoFullName === baseRepoFullName ||
+        (run.head_repository.owner &&
+          run.head_repository.owner.login.toLowerCase() ===
+            owner.toLowerCase());
+
+      if (isSameRepo) {
+        console.log(
+          `Skipping workflow run ${run.id}: action_required run is not an API-approvable fork PR workflow; manual or security approval may be required`
+        );
+        return acc;
+      }
+
       // Find the pull request for the current run
       const { data: pulls } = await octokit.rest.pulls.list({
         owner,
@@ -154,6 +176,23 @@ async function action() {
       const targetPull = targetPrNumber
         ? pulls.find((p) => p.number === targetPrNumber) || pulls[0]
         : pulls[0];
+      // List all the files in there
+      if (
+        targetPull.head &&
+        targetPull.head.repo &&
+        targetPull.base &&
+        targetPull.base.repo &&
+        targetPull.head.repo.full_name &&
+        targetPull.base.repo.full_name &&
+        targetPull.head.repo.full_name.toLowerCase() ===
+          targetPull.base.repo.full_name.toLowerCase()
+      ) {
+        console.log(
+          `Skipping workflow run ${run.id}: action_required run is not an API-approvable fork PR workflow; manual or security approval may be required`
+        );
+        return acc;
+      }
+
       // List all the files in there
       const { data: files } = await octokit.rest.pulls.listFiles({
         owner,

@@ -592,6 +592,50 @@ describe("regression tests: stale action_required runs and API eligibility", () 
     expect(mockOctokit.request).not.toHaveBeenCalled();
     expect(core.setFailed).not.toHaveBeenCalled();
   });
+
+  it("skips run when PR targetPull head and base repos match", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1179",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 123123,
+            name: ".github/workflows/commit.yml",
+            head_branch: "some-branch",
+            head_repository: {
+              owner: { login: "someone-else" },
+              full_name: "someone-else/repo",
+            },
+            pull_requests: [{ number: 1179 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [
+        {
+          number: 1179,
+          head: { repo: { full_name: "demo/repo" } },
+          base: { repo: { full_name: "demo/repo" } },
+        },
+      ],
+    });
+
+    await action();
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("action_required run is not an API-approvable fork PR workflow")
+    );
+  });
 });
 
 // --- Helpers ---
