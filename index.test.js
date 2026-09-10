@@ -30,6 +30,8 @@ beforeEach(() => {
 afterEach(() => {
   jest.restoreAllMocks();
   Object.keys(_workflowContents).forEach((k) => delete _workflowContents[k]);
+  delete github.context.payload;
+  github.context.payload = {};
 });
 
 it("throws if no token is provided", async () => {
@@ -385,6 +387,142 @@ it("approves all pending workflows (with name)", async () => {
   await action();
   expect(console.log).toBeCalledWith("Approved run '12345678'");
   expect(console.log).toBeCalledWith("Approved run '87654321'");
+});
+
+describe("regression tests: stale action_required runs and API eligibility", () => {
+  it("ignores stale action_required runs belonging to another PR (Fixture A)", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml,pr-ci.yml",
+      "pull-request-number": "1212",
+      "head-sha": "5d741254",
+    });
+    github.context.payload = {
+      pull_request: {
+        number: 1212,
+        head: { sha: "5d741254" },
+      },
+    };
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+
+    mockWorkflowContents("commit.yml", {});
+    mockWorkflowContents("pr-ci.yml", {});
+
+    // Stale run from PR #1179
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 33723706647,
+            name: ".github/workflows/commit.yml",
+            head_branch: "feat/sops-secret-sources",
+            head_sha: "007fc2fe88215a073b6676040251775e0f71283c",
+            head_repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            actor: { login: "github-actions[bot]" },
+            conclusion: "action_required",
+            pull_requests: [{ number: 1179 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [{ number: 1179 }],
+    });
+    mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+      data: [{ filename: "README.md" }],
+    });
+
+    const error403 = new Error("Forbidden");
+    error403.status = 403;
+    error403.request = {
+      url: "https://api.github.com/repos/demo/repo/actions/runs/33723706647/approve",
+    };
+    mockOctokit.request.mockRejectedValue(error403);
+
+    await action();
+
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+    expect(core.setFailed).not.toHaveBeenCalled();
+  });
+
+  it("skips same-repository action_required runs without calling approve (Fixture B)", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml,pr-ci.yml",
+      "pull-request-number": "1179",
+    });
+    github.context.payload = {
+      pull_request: {
+        number: 1179,
+        head: {
+          sha: "007fc2fe",
+          repo: { full_name: "demo/repo" },
+        },
+        base: {
+          repo: { full_name: "demo/repo" },
+        },
+      },
+    };
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+
+    mockWorkflowContents("commit.yml", {});
+    mockWorkflowContents("pr-ci.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 33723706647,
+            name: ".github/workflows/commit.yml",
+            head_branch: "feat/sops-secret-sources",
+            head_sha: "007fc2fe",
+            head_repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            actor: { login: "github-actions[bot]" },
+            conclusion: "action_required",
+            pull_requests: [{ number: 1179 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [{ number: 1179 }],
+    });
+    mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+      data: [{ filename: "README.md" }],
+    });
+
+    const error403 = new Error("Forbidden");
+    error403.status = 403;
+    error403.request = {
+      url: "https://api.github.com/repos/demo/repo/actions/runs/33723706647/approve",
+    };
+    mockOctokit.request.mockRejectedValue(error403);
+
+    await action();
+
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+    expect(core.setFailed).not.toHaveBeenCalled();
+  });
 });
 
 // --- Helpers ---
