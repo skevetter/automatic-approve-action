@@ -638,6 +638,185 @@ describe("regression tests: stale action_required runs and API eligibility", () 
   });
 });
 
+describe("separated skipped and failed approval results", () => {
+  it("exits successfully when all discovered runs are skipped", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1179",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 2,
+        workflow_runs: [
+          {
+            id: 101,
+            name: ".github/workflows/commit.yml",
+            head_branch: "feat/1",
+            head_repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            pull_requests: [{ number: 1179 }],
+          },
+          {
+            id: 102,
+            name: ".github/workflows/commit.yml",
+            head_branch: "feat/2",
+            head_repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            pull_requests: [{ number: 1179 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [{ number: 1179 }],
+    });
+
+    await action();
+
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith("Approval summary:");
+    expect(console.log).toHaveBeenCalledWith("  eligible: 0");
+    expect(console.log).toHaveBeenCalledWith("  skipped: 2");
+    expect(console.log).toHaveBeenCalledWith("  failed: 0");
+    expect(console.log).toHaveBeenCalledWith(
+      "No eligible workflow runs require API approval."
+    );
+  });
+
+  it("mixed: approves eligible run and skips ineligible run without failing", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1212",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 2,
+        workflow_runs: [
+          {
+            id: 201,
+            name: ".github/workflows/commit.yml",
+            head_branch: "fork-branch",
+            head_repository: {
+              owner: { login: "fork-user" },
+              full_name: "fork-user/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+          {
+            id: 202,
+            name: ".github/workflows/commit.yml",
+            head_branch: "same-branch",
+            head_repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [{ number: 1212 }],
+    });
+    mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+      data: [{ filename: "README.md" }],
+    });
+    mockOctokit.request.mockResolvedValue({});
+
+    await action();
+
+    expect(mockOctokit.request).toHaveBeenCalledTimes(1);
+    expect(mockOctokit.request).toHaveBeenCalledWith(
+      "POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve",
+      { owner: "demo", repo: "repo", run_id: 201 }
+    );
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith("  eligible: 1");
+    expect(console.log).toHaveBeenCalledWith("  approved: 1");
+    expect(console.log).toHaveBeenCalledWith("  skipped: 1");
+    expect(console.log).toHaveBeenCalledWith("  failed: 0");
+  });
+
+  it("mixed: fails when eligible run fails even if another was skipped", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1212",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 2,
+        workflow_runs: [
+          {
+            id: 301,
+            name: ".github/workflows/commit.yml",
+            head_branch: "fork-branch",
+            head_repository: {
+              owner: { login: "fork-user" },
+              full_name: "fork-user/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+          {
+            id: 302,
+            name: ".github/workflows/commit.yml",
+            head_branch: "same-branch",
+            head_repository: {
+              owner: { login: "demo" },
+              full_name: "demo/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [{ number: 1212 }],
+    });
+    mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+      data: [{ filename: "README.md" }],
+    });
+
+    const error403 = new Error("Forbidden");
+    error403.status = 403;
+    error403.request = {
+      url: "https://api.github.com/repos/demo/repo/actions/runs/301/approve",
+    };
+    mockOctokit.request.mockRejectedValue(error403);
+
+    await action();
+
+    expect(mockOctokit.request).toHaveBeenCalledTimes(1);
+    expect(core.setFailed).toHaveBeenCalledWith("All 1 approval(s) failed");
+    expect(console.log).toHaveBeenCalledWith("  eligible: 1");
+    expect(console.log).toHaveBeenCalledWith("  approved: 0");
+    expect(console.log).toHaveBeenCalledWith("  skipped: 1");
+    expect(console.log).toHaveBeenCalledWith("  failed: 1");
+  });
+});
+
 // --- Helpers ---
 
 function mockInput(inputs) {

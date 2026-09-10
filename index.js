@@ -97,46 +97,82 @@ async function action() {
       return;
     }
 
-    // Remove any PRs that edit the `.github/workflows` directory
-    runs = await runs.reduce(async (acc, run) => {
-      // Scope candidate to current PR if PR context is present
-      if (targetPrNumber && run.pull_requests && run.pull_requests.length > 0) {
-        const matchesPr = run.pull_requests.some(
-          (p) => p.number === targetPrNumber
-        );
-        if (!matchesPr) {
-          const runPrs = run.pull_requests.map((p) => p.number).join(", #");
-          console.log(
-            `Ignoring workflow run ${run.id}: belongs to PR #${runPrs}, not current PR #${targetPrNumber}`
-          );
-          return acc;
-        }
-      }
+    console.log("Automatic workflow approval");
+    if (targetPrNumber) {
+      console.log(`PR: #${targetPrNumber}`);
+    }
+    if (targetHeadSha) {
+      console.log(`Head SHA: ${targetHeadSha}`);
+    }
 
-      if (targetHeadSha && run.head_sha && run.head_sha !== targetHeadSha) {
-        console.log(
-          `Ignoring workflow run ${run.id}: head SHA ${run.head_sha} does not match current PR head SHA ${targetHeadSha}`
-        );
-        return acc;
-      }
-
-      // If the fork has been deleted head_repository will be null
-      if (!run.head_repository) {
-        console.log(
-          `No head_repository found for '${run.html_url}'. Must be manually approved`
-        );
-        return acc;
-      }
-
-      // Determine if this run represents an API-approvable fork PR hold
+    // Classify candidates
+    const candidates = [];
+    for (const run of runs) {
+      const workflowPath =
+        nameToWorkflow[run.name] || run.path || run.name;
       const baseRepoFullName = `${owner}/${repo}`.toLowerCase();
       const headRepoFullName = (
-        run.head_repository.full_name ||
-        (run.head_repository.owner
+        run.head_repository?.full_name ||
+        (run.head_repository?.owner
           ? `${run.head_repository.owner.login}/${repo}`
           : "")
       ).toLowerCase();
 
+      const candidate = {
+        runId: run.id,
+        workflowPath,
+        run,
+        headSha: run.head_sha,
+        actor: run.actor ? run.actor.login : undefined,
+        headRepository:
+          run.head_repository?.full_name ||
+          (run.head_repository?.owner
+            ? run.head_repository.owner.login
+            : undefined),
+        baseRepository: `${owner}/${repo}`,
+        pullRequestNumber: undefined,
+        disposition: "eligible",
+        reason: undefined,
+      };
+
+      // 1. Check PR identity scoping if PRs known on run
+      if (targetPrNumber && run.pull_requests && run.pull_requests.length > 0) {
+        const runPrNumbers = run.pull_requests.map((p) => p.number);
+        candidate.pullRequestNumber = runPrNumbers[0];
+        if (!runPrNumbers.includes(targetPrNumber)) {
+          candidate.disposition = "unrelated";
+          candidate.reason = `belongs to PR #${runPrNumbers.join(", #")}, not current PR #${targetPrNumber}`;
+          candidates.push(candidate);
+          console.log(
+            `Ignoring workflow run ${run.id}: belongs to PR #${runPrNumbers.join(", #")}, not current PR #${targetPrNumber}`
+          );
+          continue;
+        }
+      }
+
+      // 2. Check head SHA
+      if (targetHeadSha && run.head_sha && run.head_sha !== targetHeadSha) {
+        candidate.disposition = "unrelated";
+        candidate.reason = `head SHA ${run.head_sha} does not match current PR head SHA ${targetHeadSha}`;
+        candidates.push(candidate);
+        console.log(
+          `Ignoring workflow run ${run.id}: head SHA ${run.head_sha} does not match current PR head SHA ${targetHeadSha}`
+        );
+        continue;
+      }
+
+      // 3. Check head_repository existence
+      if (!run.head_repository) {
+        candidate.disposition = "manual_required";
+        candidate.reason = `No head_repository found for '${run.html_url}'. Must be manually approved`;
+        candidates.push(candidate);
+        console.log(
+          `No head_repository found for '${run.html_url}'. Must be manually approved`
+        );
+        continue;
+      }
+
+      // 4. Check repository relationship (same repo vs fork)
       const isSameRepo =
         headRepoFullName === baseRepoFullName ||
         (run.head_repository.owner &&
@@ -144,13 +180,17 @@ async function action() {
             owner.toLowerCase());
 
       if (isSameRepo) {
+        candidate.disposition = "manual_required";
+        candidate.reason =
+          "action_required run is not an API-approvable fork PR workflow; manual or security approval may be required";
+        candidates.push(candidate);
         console.log(
           `Skipping workflow run ${run.id}: action_required run is not an API-approvable fork PR workflow; manual or security approval may be required`
         );
-        return acc;
+        continue;
       }
 
-      // Find the pull request for the current run
+      // 5. Look up PR if not yet resolved
       const { data: pulls } = await octokit.rest.pulls.list({
         owner,
         repo,
@@ -159,24 +199,32 @@ async function action() {
       });
 
       if (pulls.length === 0) {
+        candidate.disposition = "unrelated";
+        candidate.reason = `No pull request found for '${run.head_repository.owner.login}:${run.head_branch}'`;
+        candidates.push(candidate);
         console.log(
           `No pull request found for '${run.head_repository.owner.login}:${run.head_branch}'`
         );
-        return acc;
+        continue;
       }
 
-      if (targetPrNumber && !pulls.some((p) => p.number === targetPrNumber)) {
-        const pullNumbers = pulls.map((p) => p.number).join(", #");
+      const pullNumbers = pulls.map((p) => p.number);
+      if (targetPrNumber && !pullNumbers.includes(targetPrNumber)) {
+        candidate.disposition = "unrelated";
+        candidate.reason = `PR #${pullNumbers.join(", #") || "unknown"} does not match current PR #${targetPrNumber}`;
+        candidates.push(candidate);
         console.log(
-          `Ignoring workflow run ${run.id}: PR #${pullNumbers || "unknown"} does not match current PR #${targetPrNumber}`
+          `Ignoring workflow run ${run.id}: PR #${pullNumbers.join(", #") || "unknown"} does not match current PR #${targetPrNumber}`
         );
-        return acc;
+        continue;
       }
 
       const targetPull = targetPrNumber
         ? pulls.find((p) => p.number === targetPrNumber) || pulls[0]
         : pulls[0];
-      // List all the files in there
+
+      candidate.pullRequestNumber = targetPull.number;
+
       if (
         targetPull.head &&
         targetPull.head.repo &&
@@ -187,13 +235,17 @@ async function action() {
         targetPull.head.repo.full_name.toLowerCase() ===
           targetPull.base.repo.full_name.toLowerCase()
       ) {
+        candidate.disposition = "manual_required";
+        candidate.reason =
+          "action_required run is not an API-approvable fork PR workflow; manual or security approval may be required";
+        candidates.push(candidate);
         console.log(
           `Skipping workflow run ${run.id}: action_required run is not an API-approvable fork PR workflow; manual or security approval may be required`
         );
-        return acc;
+        continue;
       }
 
-      // List all the files in there
+      // 6. Check modified files
       const { data: files } = await octokit.rest.pulls.listFiles({
         owner,
         repo,
@@ -220,44 +272,76 @@ async function action() {
         return true;
       });
 
-      const matching = [].concat(matching_danger, matching_unsafe)
+      const matching = [].concat(matching_danger, matching_unsafe);
 
-      // If we changed any files in that directory, return the current set and skip this run
       if (matching.length > 0) {
+        candidate.disposition = "manual_required";
+        candidate.reason = "PR modifies dangerous or non-safe files";
+        candidates.push(candidate);
         console.log(`Skipped dangerous run '${run.id}'`);
-        return acc;
+        continue;
       }
 
-      // Otherwise add this run to the list of runs to execute
-      return (await acc).concat(run);
-    }, []);
+      // Passed all checks: eligible
+      candidate.disposition = "eligible";
+      candidate.reason = "API-approvable fork PR workflow";
+      candidates.push(candidate);
+    }
 
-    // Loop through them and approve all, continuing on individual failures
+    const eligibleCandidates = candidates.filter(
+      (c) => c.disposition === "eligible"
+    );
+    const skippedCandidates = candidates.filter(
+      (c) => c.disposition === "manual_required"
+    );
+    const ignoredCandidates = candidates.filter(
+      (c) => c.disposition === "unrelated"
+    );
+
+    // Loop through eligible runs and approve all, continuing on individual failures
     const results = await Promise.allSettled(
-      runs.map(async (run) => {
+      eligibleCandidates.map(async (candidate) => {
         await octokit.request(
           "POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve",
           {
             owner,
             repo,
-            run_id: run.id,
+            run_id: candidate.runId,
           }
         );
-        console.log(`Approved run '${run.id}'`);
+        console.log(`Approved run '${candidate.runId}'`);
+        return candidate;
       })
     );
 
     const failures = results.filter((r) => r.status === "rejected");
+    const successful = results.filter((r) => r.status === "fulfilled");
+
+    console.log("Approval summary:");
+    console.log(`  candidates discovered: ${candidates.length}`);
+    console.log(`  eligible: ${eligibleCandidates.length}`);
+    console.log(`  approved: ${successful.length}`);
+    console.log(`  skipped: ${skippedCandidates.length}`);
+    console.log(`  ignored: ${ignoredCandidates.length}`);
+    console.log(`  failed: ${failures.length}`);
+
+    if (eligibleCandidates.length === 0) {
+      console.log("No eligible workflow runs require API approval.");
+      return;
+    }
+
     if (failures.length > 0) {
       for (const f of failures) {
         const err = f.reason;
         if (err.request && err.request.url) {
-          console.log(`Warning: failed to approve run - ${err.request.url} - HTTP ${err.status}`);
+          console.log(
+            `Warning: failed to approve run - ${err.request.url} - HTTP ${err.status}`
+          );
         } else {
           console.log(`Warning: failed to approve run - ${err.message}`);
         }
       }
-      const approved = results.length - failures.length;
+      const approved = successful.length;
       if (approved === 0) {
         return core.setFailed(`All ${failures.length} approval(s) failed`);
       }
