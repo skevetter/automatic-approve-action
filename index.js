@@ -27,6 +27,27 @@ async function action() {
     .getInput("safe_files")
     .split(",")
     .filter((r) => r);
+    const pullRequestNumberInput =
+      core.getInput("pull-request-number") ||
+      core.getInput("pull_request_number");
+    const headShaInput =
+      core.getInput("head-sha") || core.getInput("head_sha");
+
+    const eventPullRequest =
+      github.context.payload && github.context.payload.pull_request;
+
+    const targetPrNumber = pullRequestNumberInput
+      ? parseInt(pullRequestNumberInput, 10)
+      : eventPullRequest
+      ? eventPullRequest.number
+      : null;
+
+    const targetHeadSha =
+      headShaInput ||
+      (eventPullRequest && eventPullRequest.head
+        ? eventPullRequest.head.sha
+        : null);
+
 
     // Fetch runs that require action
     let { data: runs } = await octokit.rest.actions.listWorkflowRunsForRepo({
@@ -78,6 +99,27 @@ async function action() {
 
     // Remove any PRs that edit the `.github/workflows` directory
     runs = await runs.reduce(async (acc, run) => {
+      // Scope candidate to current PR if PR context is present
+      if (targetPrNumber && run.pull_requests && run.pull_requests.length > 0) {
+        const matchesPr = run.pull_requests.some(
+          (p) => p.number === targetPrNumber
+        );
+        if (!matchesPr) {
+          const runPrs = run.pull_requests.map((p) => p.number).join(", #");
+          console.log(
+            `Ignoring workflow run ${run.id}: belongs to PR #${runPrs}, not current PR #${targetPrNumber}`
+          );
+          return acc;
+        }
+      }
+
+      if (targetHeadSha && run.head_sha && run.head_sha !== targetHeadSha) {
+        console.log(
+          `Ignoring workflow run ${run.id}: head SHA ${run.head_sha} does not match current PR head SHA ${targetHeadSha}`
+        );
+        return acc;
+      }
+
       // If the fork has been deleted head_repository will be null
       if (!run.head_repository) {
         console.log(
@@ -101,11 +143,22 @@ async function action() {
         return acc;
       }
 
+      if (targetPrNumber && !pulls.some((p) => p.number === targetPrNumber)) {
+        const pullNumbers = pulls.map((p) => p.number).join(", #");
+        console.log(
+          `Ignoring workflow run ${run.id}: PR #${pullNumbers || "unknown"} does not match current PR #${targetPrNumber}`
+        );
+        return acc;
+      }
+
+      const targetPull = targetPrNumber
+        ? pulls.find((p) => p.number === targetPrNumber) || pulls[0]
+        : pulls[0];
       // List all the files in there
       const { data: files } = await octokit.rest.pulls.listFiles({
         owner,
         repo,
-        pull_number: pulls[0].number,
+        pull_number: targetPull.number,
       });
 
       const matching_danger = files.filter((f) => {

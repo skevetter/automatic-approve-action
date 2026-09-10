@@ -454,6 +454,75 @@ describe("regression tests: stale action_required runs and API eligibility", () 
     expect(mockOctokit.request).not.toHaveBeenCalled();
     expect(core.setFailed).not.toHaveBeenCalled();
   });
+  it("scopes candidates using github.context event payload when input is not provided", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+    });
+    github.context.payload = {
+      pull_request: {
+        number: 1212,
+        head: { sha: "5d741254" },
+      },
+    };
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 999999,
+            name: ".github/workflows/commit.yml",
+            head_branch: "other-branch",
+            head_sha: "other-sha",
+            head_repository: {
+              owner: { login: "fork-user" },
+              full_name: "fork-user/repo",
+            },
+            pull_requests: [{ number: 999 }],
+          },
+        ],
+      },
+    });
+
+    await action();
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+  });
+
+  it("ignores runs where head_sha does not match target head-sha", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1212",
+      "head-sha": "expected-head-sha",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 888888,
+            name: ".github/workflows/commit.yml",
+            head_branch: "pr-branch",
+            head_sha: "stale-head-sha",
+            head_repository: {
+              owner: { login: "fork-user" },
+              full_name: "fork-user/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+        ],
+      },
+    });
+
+    await action();
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+  });
 
   it("skips same-repository action_required runs without calling approve (Fixture B)", async () => {
     mockInput({

@@ -19,3 +19,9 @@ inputs:
   safe_files:
     description: Filenames that allow the PR being automatically approved
     required: false
+  pull-request-number:
+    description: Pull request number to scope approvals to
+    required: false
+  head-sha:
+    description: Head SHA of the pull request to scope approvals to
+    required: false
