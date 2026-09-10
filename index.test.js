@@ -817,6 +817,194 @@ describe("separated skipped and failed approval results", () => {
   });
 });
 
+describe("test matrix coverage: fork approval and 403 failure semantics", () => {
+  it("approves valid first-time fork hold for current PR", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1212",
+      "head-sha": "5d741254",
+    });
+    github.context.payload = {
+      pull_request: {
+        number: 1212,
+        head: { sha: "5d741254" },
+      },
+    };
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 501,
+            name: ".github/workflows/commit.yml",
+            head_branch: "feature-branch",
+            head_sha: "5d741254",
+            head_repository: {
+              owner: { login: "first-time-contributor" },
+              full_name: "first-time-contributor/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [{ number: 1212 }],
+    });
+    mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+      data: [{ filename: "src/feature.js" }],
+    });
+    mockOctokit.request.mockResolvedValue({});
+
+    await action();
+
+    expect(mockOctokit.request).toHaveBeenCalledTimes(1);
+    expect(mockOctokit.request).toHaveBeenCalledWith(
+      "POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve",
+      { owner: "demo", repo: "repo", run_id: 501 }
+    );
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith("Approved run '501'");
+    expect(console.log).toHaveBeenCalledWith("  eligible: 1");
+    expect(console.log).toHaveBeenCalledWith("  approved: 1");
+    expect(console.log).toHaveBeenCalledWith("  failed: 0");
+  });
+
+  it("fails when an eligible fork approval request returns HTTP 403 (Task 6)", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1212",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 601,
+            name: ".github/workflows/commit.yml",
+            head_branch: "fork-branch",
+            head_sha: "sha601",
+            head_repository: {
+              owner: { login: "fork-author" },
+              full_name: "fork-author/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+        ],
+      },
+    });
+
+    mockOctokit.rest.pulls.list.mockResolvedValue({
+      data: [{ number: 1212 }],
+    });
+    mockOctokit.rest.pulls.listFiles.mockResolvedValue({
+      data: [{ filename: "README.md" }],
+    });
+
+    const error403 = new Error("Resource not accessible by integration");
+    error403.status = 403;
+    error403.request = {
+      url: "https://api.github.com/repos/demo/repo/actions/runs/601/approve",
+    };
+    mockOctokit.request.mockRejectedValue(error403);
+
+    await action();
+
+    expect(mockOctokit.request).toHaveBeenCalledTimes(1);
+    expect(core.setFailed).toHaveBeenCalledWith("All 1 approval(s) failed");
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("Warning: failed to approve run")
+    );
+  });
+
+  it("ignores valid fork hold belonging to a different PR", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1212",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    // Valid fork hold from PR #1215
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 701,
+            name: ".github/workflows/commit.yml",
+            head_branch: "fork-pr-1215",
+            head_sha: "sha1215",
+            head_repository: {
+              owner: { login: "other-fork-contributor" },
+              full_name: "other-fork-contributor/repo",
+            },
+            pull_requests: [{ number: 1215 }],
+          },
+        ],
+      },
+    });
+
+    await action();
+
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith("  ignored: 1");
+    expect(console.log).toHaveBeenCalledWith("  eligible: 0");
+  });
+
+  it("ignores candidate run when workflow is not in configured allowlist", async () => {
+    mockInput({
+      token: "my-token",
+      workflows: "commit.yml",
+      "pull-request-number": "1212",
+    });
+    jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(core, "setFailed").mockImplementation(() => {});
+    mockWorkflowContents("commit.yml", {});
+
+    mockOctokit.rest.actions.listWorkflowRunsForRepo.mockResolvedValue({
+      data: {
+        total_count: 1,
+        workflow_runs: [
+          {
+            id: 801,
+            name: ".github/workflows/unrelated.yml",
+            head_branch: "fork-branch",
+            head_sha: "sha801",
+            head_repository: {
+              owner: { login: "fork-user" },
+              full_name: "fork-user/repo",
+            },
+            pull_requests: [{ number: 1212 }],
+          },
+        ],
+      },
+    });
+
+    await action();
+
+    expect(mockOctokit.request).not.toHaveBeenCalled();
+    expect(core.setFailed).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(
+      "No runs found for the following workflows: .github/workflows/commit.yml"
+    );
+  });
+});
+
 // --- Helpers ---
 
 function mockInput(inputs) {
